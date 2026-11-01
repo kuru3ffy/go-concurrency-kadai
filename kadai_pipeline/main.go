@@ -91,7 +91,13 @@ func countFile(ctx context.Context, path string) (int, error) {
 			inWord = true
 		}
 	}
-	return count, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func countWords(ctx context.Context, paths <-chan string, results chan<- Result) {
@@ -117,6 +123,8 @@ func run() error {
 	timeout := flag.Duration("timeout", 30*time.Second, "処理の制限時間（例：30s、1us）")
 	dir := flag.String("dir", "", "探索するディレクトリ（省略時はダミーファイルを生成）")
 	flag.Parse()
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
 	root := *dir
 	if root == "" {
 		var err error
@@ -130,8 +138,6 @@ func run() error {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
 	paths := make(chan string)
 	results := make(chan Result)
 	var wg sync.WaitGroup
@@ -148,18 +154,11 @@ func run() error {
 		}()
 	}
 
-	// 終了監視もContextを受け取り、キャンセル時も全ステージの後片付けを待つ。
-	done := make(chan struct{})
-	go func(ctx context.Context) {
-		defer close(done)
-		select {
-		case <-ctx.Done():
-			// キャンセル済みでも、ワーカーが終了するまで待ってから閉じる。
-		default:
-		}
+	// キャンセル時も全ステージの終了を待ってから結果チャネルを閉じる。
+	go func() {
 		wg.Wait()
 		close(results)
-	}(ctx)
+	}()
 
 	files, total, failures := 0, 0, 0
 	for result := range results {
@@ -172,7 +171,6 @@ func run() error {
 		files++
 		total += result.Words
 	}
-	<-done
 	err := <-discoveryError
 	if err != nil {
 		fmt.Printf("探索エラー: %v\n", err)
