@@ -11,11 +11,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 type Result struct {
 	Path  string
 	Words int
+	Err   error
 }
 
 // テスト用のダミーファイルを作成する関数
@@ -35,9 +38,9 @@ func generateDummyFiles(dir string) error {
 	return nil
 }
 
-func findFiles(ctx context.Context, root string, paths chan<- string) {
+func findFiles(ctx context.Context, root string, paths chan<- string) error {
 	defer close(paths)
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -58,9 +61,6 @@ func findFiles(ctx context.Context, root string, paths chan<- string) {
 		}
 		return nil
 	})
-	if err != nil {
-		fmt.Printf("探索エラー: %v\n", err)
-	}
 }
 
 func countFile(ctx context.Context, path string) (int, error) {
@@ -73,15 +73,23 @@ func countFile(ctx context.Context, path string) (int, error) {
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
-	scanner.Split(bufio.ScanWords)
+	// 単語全体をバッファに保持せず、文字ごとの空白境界を数える。
+	scanner.Split(bufio.ScanRunes)
 	count := 0
+	inWord := false
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		default:
 		}
-		count++
+		r, _ := utf8.DecodeRune(scanner.Bytes())
+		if unicode.IsSpace(r) {
+			inWord = false
+		} else if !inWord {
+			count++
+			inWord = true
+		}
 	}
 	return count, scanner.Err()
 }
@@ -96,14 +104,10 @@ func countWords(ctx context.Context, paths <-chan string, results chan<- Result)
 				return
 			}
 			words, err := countFile(ctx, path)
-			if err != nil {
-				fmt.Printf("集計エラー: %s: %v\n", path, err)
-				continue
-			}
 			select {
 			case <-ctx.Done():
 				return
-			case results <- Result{Path: path, Words: words}:
+			case results <- Result{Path: path, Words: words, Err: err}:
 			}
 		}
 	}
@@ -131,10 +135,11 @@ func run() error {
 	paths := make(chan string)
 	results := make(chan Result)
 	var wg sync.WaitGroup
+	discoveryError := make(chan error, 1)
 	wg.Add(5)
 	go func() {
 		defer wg.Done()
-		findFiles(ctx, root, paths)
+		discoveryError <- findFiles(ctx, root, paths)
 	}()
 	for i := 0; i < 4; i++ {
 		go func() {
@@ -156,17 +161,32 @@ func run() error {
 		close(results)
 	}(ctx)
 
-	files, total := 0, 0
+	files, total, failures := 0, 0, 0
 	for result := range results {
+		if result.Err != nil {
+			fmt.Printf("集計エラー: %s: %v\n", result.Path, result.Err)
+			failures++
+			continue
+		}
 		fmt.Printf("%s: %d単語\n", result.Path, result.Words)
 		files++
 		total += result.Words
 	}
 	<-done
-	if ctx.Err() != nil {
-		fmt.Printf("キャンセル: %v\n", ctx.Err())
+	err := <-discoveryError
+	if err != nil {
+		fmt.Printf("探索エラー: %v\n", err)
 	}
-	fmt.Printf("処理完了\n処理ファイル数: %d\n総単語数: %d\n", files, total)
+	fmt.Printf("処理完了\n処理ファイル数: %d\n総単語数: %d\n失敗ファイル数: %d\n", files, total, failures)
+	if ctx.Err() != nil {
+		return fmt.Errorf("処理を中断しました：%w", ctx.Err())
+	}
+	if err != nil {
+		return fmt.Errorf("探索を完了できませんでした：%w", err)
+	}
+	if failures > 0 {
+		return fmt.Errorf("%d件のファイルを集計できませんでした", failures)
+	}
 	return nil
 }
 
